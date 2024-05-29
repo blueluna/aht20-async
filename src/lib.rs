@@ -98,8 +98,6 @@ where
 
         dev.reset().await?;
 
-        dev.calibrate().await?;
-
         Ok(dev)
     }
 
