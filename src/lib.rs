@@ -37,6 +37,8 @@ pub enum Error<I2CERR> {
     Uncalibrated,
     /// Checksum mismatch.
     Checksum,
+    /// Device access timed out
+    Timeout,
     /// Underlying I2C error.
     I2c(I2CERR),
 }
@@ -104,20 +106,51 @@ where
     /// Gets the sensor status.
     async fn status(&mut self) -> Result<StatusFlags, I2C::Error> {
         let buf = &mut [0u8; 1];
-        self.i2c.write_read(I2C_ADDRESS, &[0u8], buf).await?;
+        self.i2c.read(I2C_ADDRESS, buf).await?;
 
         Ok(StatusFlags::from_bits_retain(buf[0]))
     }
 
+    /// Start a measurement
+    async fn start_measurement(&mut self) -> Result<(), I2C::Error> {
+        // Send trigger measurement command
+        self.i2c.write(I2C_ADDRESS, &[0xAC, 0x33, 0x00]).await?;
+        Ok(())
+    }
+
+    /// Wait until ready
+    async fn ready_wait(&mut self, milliseconds: u32, count: u8) -> Result<(), Error<I2C::Error>> {
+        // Wait until not busy
+        for _ in 0..count {
+            if self.status().await?.contains(StatusFlags::BUSY) {
+                self.delay.delay_ms(milliseconds).await;
+            } else {
+                return Ok(());
+            }
+        }
+        return Err(Error::Timeout);
+    }
+
     /// Self-calibrate the sensor.
     pub async fn calibrate(&mut self) -> Result<(), Error<I2C::Error>> {
+        // Check if the sensor is calibrated
+        if self
+            .status()
+            .await?
+            .contains(StatusFlags::CALIBRATION_ENABLE)
+        {
+            return Ok(());
+        }
+
         // Send calibrate command
-        self.i2c.write(I2C_ADDRESS, &[0xE1, 0x08, 0x00]).await?;
+        self.i2c.write(I2C_ADDRESS, &[0xbe, 0x08, 0x00]).await?;
+
+        self.delay.delay_ms(10).await;
+
+        self.start_measurement().await?;
 
         // Wait until not busy
-        while self.status().await?.contains(StatusFlags::BUSY) {
-            self.delay.delay_ms(10).await;
-        }
+        self.ready_wait(10, 10).await?;
 
         // Confirm sensor is calibrated
         if !self
@@ -145,16 +178,14 @@ where
     /// Reads humidity and temperature.
     pub async fn read(&mut self) -> Result<(Humidity, Temperature), Error<I2C::Error>> {
         // Send trigger measurement command
-        self.i2c.write(I2C_ADDRESS, &[0xAC, 0x33, 0x00]).await?;
+        self.start_measurement().await?;
 
         // Wait until not busy
-        while self.status().await?.contains(StatusFlags::BUSY) {
-            self.delay.delay_ms(10).await;
-        }
+        self.ready_wait(10, 10).await?;
 
         // Read in sensor data
         let buf = &mut [0u8; 7];
-        self.i2c.write_read(I2C_ADDRESS, &[0u8], buf).await?;
+        self.i2c.read(I2C_ADDRESS, buf).await?;
 
         // Check for CRC mismatch
         let crc = &mut 0u8;
